@@ -1,0 +1,1235 @@
+# Rethinking KL Divergence in RLHF: From Single Sample to Mini-Batch to Expectation
+
+## Core Argument: Sufficient Effective Sample Size
+
+In Reinforcement Learning from Human Feedback (RLHF), policy optimization typically involves the KL divergence between the policy $\pi_\theta(a_t|s_t)$ and the reference policy $\pi_{\text{ref}}(a_t|s_t)$. The KL divergence measures the distance between two distributions and is computationally expensive in practice (classification requires calculation over the entire vocabulary), so it is usually approximated using Monte Carlo methods based on sampling estimates. Each prompt and answer pair is treated as a trajectory, and only the sampled category is retained, representing a single sample from the distribution. Moreover, when optimizing the language model parameters using the single sample as a loss function, one should sample an unbiased gradient estimate of the KL divergence rather than an unbiased estimate of the KL divergence value itself.
+
+
+
+Optimizing the KL divergence distribution based on the sampled gradient estimate requires specific Monte Carlo conditions to be equivalent to directly optimizing the KL divergence distribution: Given that the policy parameters $\theta$ remain approximately unchanged (i.e., $\theta$ is updated minimally or not at all during sampling), sufficiently large sample size must be obtained from $\pi_\theta(a_t|s_t)$ to ensure that the gradient of the Monte Carlo KL divergence estimate based on trajectory sampling effectively approximates the true gradient of the KL divergence distribution with respect to the model parameters. Formally, let $\nabla_\theta \mathbb{D}_{\text{KL}}(\pi_\theta || \pi_{\text{ref}})$ be the true gradient of the KL divergence distribution, and $\nabla_\theta \widehat{\mathbb{D}}_{\text{KL}}(\pi_\theta || \pi_{\text{ref}})$ be the Monte Carlo approximation of the KL divergence gradient based on finite sampled samples. The condition for their approximate equivalence is a sufficiently large effective sample size, specifically:
+
+
+
+- Policy parameter stability (validity): During the sampling process, the policy parameters $\theta$ should remain stable or change only slightly to ensure consistency between the sampling distribution and the current policy distribution.
+
+- Sufficient sampling sample size (adequacy): The number of sampled samples must be large enough to ensure the convergence of the Monte Carlo estimate.
+
+
+
+The table below summarizes whether different RLHF algorithms satisfy the stability of the policy parameters $\theta$ during sampling and have a sufficiently large sampling sample size:
+
+
+
+| | PPO | GRPO_on - policy | GRPO_off-policy | DPO |
+| --- | --- | --- | --- | --- |
+| Policy parameter stability (same $\theta$ during sampling or minimal deviation) | $\checkmark$ | $\checkmark$ | $\checkmark$ | ? |
+| Sufficient sampling sample size | $\checkmark$ | ? | $\checkmark$ | $\checkmark$ |
+
+
+
+Here, “$\checkmark$” indicates that the condition is met, “$\times$” indicates that it is not met, and “?” indicates that the situation is unknown or depends on the specific implementation. This table emphasizes that the stability of the policy parameters and the adequacy of the sample size are crucial when estimating the KL divergence gradient using sampled samples.
+
+
+
+## Contributions
+
+
+
+The main academic contributions of this paper lie in the in-depth theoretical analysis and empirical exploration of reinforcement learning algorithms based on KL divergence, specifically in the following aspects:
+
+
+
+- **Unbiased estimation of the KL divergence gradient value rather than the KL divergence value, and the conditions for effective estimation**
+
+    - Directly calculating the KL divergence as a loss function based on the definition over the entire vocabulary is theoretically feasible but computationally expensive. In practice, sampling-based methods are needed, retaining only the probability values of each token in the sampled trajectory.
+
+    - As a loss function, it is more appropriate to estimate the unbiased gradient value of the KL divergence rather than the KL divergence value itself. In [classification_KL](#classification_KL), this paper derives the analytical expression of the KL divergence gradient during sampling. The condition for effective estimation is that the effective size of the sample must be sufficiently large: sampling many samples with a stable policy.
+
+- **k1, k2, k3**
+
+    - In [klequal](#klequal), it is proven that the mathematical equivalence between k1 estimation in the reward function and k2 estimation as a loss function, and in [KL_loss_reward](#KL_loss_reward), the superiority of the k2 loss function over the k3 loss function is demonstrated.
+
+    - In [k3 reward](#k3 reward), the expression of the reward function after reparameterizing the k3 loss function in the GRPO algorithm is derived.
+
+    - Counterexamples are provided to argue that the variance of the k3 estimate is not always smaller than that of k1 and k2, refuting the existing literature's claim of the absolute superiority of the k3 estimate (e.g., [kl_approx](#kl_approx), [shao2024deepseekmath](#shao2024deepseekmath)).
+
+- **Derivation and clarification of the PPO algorithm's reward function:** In [subsec:equi_reward](#subsec:equi_reward), the original reward function formula of the PPO algorithm is derived, clarifying potentially ambiguous statements in the existing literature [ouyang2022training](#ouyang2022training), [stiennon2020learning](#stiennon2020learning), [jaques2019way](#jaques2019way). The PPO reward function is effective because it happens to meet the condition of having a sufficiently large effective sample size in practice.
+
+- **Correction and extension of the GRPO algorithm's theory and implementation:** The original GRPO paper's algorithm [shao2024deepseekmath](#shao2024deepseekmath) is only valid in the on-policy setting, but it is approximate or incorrect in the off-policy setting. To address this issue, this paper provides theoretical corrections in [grpo off policy](#grpo off policy) and offers a specific code implementation (see [https://github.com/OpenRLHF/OpenRLHF/pull/840](https://github.com/OpenRLHF/OpenRLHF/pull/840)), expanding the applicability of the GRPO algorithm.
+
+
+
+## Derivation of KL Gradient and PPO Reward Function
+
+
+
+### Modeling of RLHF Objective Optimization Function
+
+
+
+Reinforcement Learning from Human Feedback (RLHF) can be modeled as the following optimization problem:
+
+
+
+$$\arg\max_{\theta} J = \underbrace{\mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[r(x,y)\right]}_{\text{Reward Maximization Term}} - \beta \underbrace{ \left[ \mathbb{D}_{\text{KL}}\left(\pi_{\theta}(a_t|s_t) \mid\mid \pi_{\text{ref}}(a_t|s_t) \right) \right]}_{\text{Policy Constraint Term}}$$
+
+$$s_t \sim d^{\pi}(s):=\mathbb{E}_{x\sim\mathcal{D}}\left[\mathbb{E}_{y\sim\pi_{\theta}(\cdot|x)} \left( \sum_{t = 0}^{T - 1}\mathbb{I}\{s_t = s\} \right) \right], a_t \sim\pi_{\theta}(\cdot|x)$$
+
+
+
+Here, $x$ is the input prompt, and $y$ is the output answer. $\pi_{\theta}$ is the output probability of the LLM at parameter $\theta$, which is a variable, and $\theta$ is the parameter to be optimized. $\pi_{\text{ref}}$ is the reference model, which is not a variable, and its parameters are not optimized. $\beta$ is the temperature coefficient, controlling the degree to which the policy deviates from the reference model $\pi_{\text{ref}}$. This objective function contains two key parts: maximizing the expected reward and the KL divergence constraint.
+
+
+
+### Decomposition and Specific Implementation of the RLHF Objective Optimization Function
+
+
+
+Combining the reward maximization function's loss term $\mathcal{L}_R(\theta)$ and the KL divergence constraint term $\mathcal{L}_{\text{KL}}(\pi_\theta, \pi_{\text{ref}})$, the complete loss function can be expressed as:
+
+
+
+$$L_{\text{total}} =- \left( \mathcal{L}_R(\theta) - \beta \mathcal{L}_{\text{KL}}(\pi_\theta, \pi_{\text{ref}}) \right)$$
+
+
+
+#### Loss Function for Reward Maximization
+
+
+
+The loss function for the reward term is:
+
+
+
+$$-\mathcal{L}_R(\theta) =\mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[ r(x,y)\right] =\mathbb{E}_{x \sim D}\sum_{a_t \in {Vocab} }\left[\pi_{\theta}(a_t|s_t) r(x,y)\right]$$
+
+
+
+After taking the gradient and performing equivalent transformations:
+
+
+
+$$\begin{aligned} -\nabla_\theta \mathcal{L}_R(\theta) &=\nabla_\theta \mathbb{E}_{x \sim D}\sum_{a_t \in {Vocab} }\left[\pi_{\theta}(a_t|s_t) \cdot r(x,y)\right] \\&=\mathbb{E}_{x \sim D}\sum_{a_t \in {Vocab} }\left[\nabla_\theta\pi_{\theta}(a_t|s_t)\cdot r(x,y)\right] \\&=\mathbb{E}_{x \sim D}\sum_{a_t \in {Vocab} }\left[\pi_{\theta}(a_t|s_t)\frac{\nabla_\theta\pi_{\theta}(a_t|s_t)}{\pi_{\theta}(a_t|s_t)}\cdot r(x,y)\right] \\&=\mathbb{E}_{x \sim D}\sum_{a_t \in {Vocab} }\left[\pi_{\theta}(a_t|s_t)\nabla_\theta\log\pi_{\theta}(a_t|s_t)\cdot r(x,y)\right] \\&=\mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[\nabla_\theta\log\pi_{\theta}(a_t|s_t)\cdot r(x,y)\right] \end{aligned}$$
+
+
+
+Based on the gradient, the loss function for the reward term can be rewritten in a more common form:
+
+
+
+$$-\mathcal{L}_R(\theta) =\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ r(x,y)\log\pi_\theta(a_t|s_t)\right]$$
+
+
+
+Here, $\theta_{\text{old}}$ is the model parameter at the time of sampling, which is not a variable; $\theta$ is the model parameter during RL training, and $\pi_{\theta}$ is the variable. In the on-policy case, $\theta_{\text{old}}$ and $\theta$ are numerically equal.
+
+
+
+In actual computation, due to the limitations of the reward model, calculating $r(x,y)$ for all $a_t$ in the vocabulary is almost impossible. The Monte Carlo estimate is used to sample and calculate the expectation of $r(x,y)$ over $y$:
+
+
+
+$$-\mathcal{L}_R(\theta) =\frac{1}{M \cdot N}\sum_{i=1}^{M}\sum_{j=1}^{N}\pi_{\theta_{\text{old}}}(a_t^{j}|s_t^{i})\left[ r(x,y)\log\pi_\theta(a_t^{j}|s_t^{i})\right]$$
+
+
+
+The Monte Carlo algorithm's effectiveness depends on a sufficiently large effective sample size.
+
+
+
+#### Loss Function for KL Penalty
+
+
+
+$$\text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t)) = \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[ \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right]$$
+
+
+
+The specific derivation of the KL penalty gradient is shown in [KL:nabla](#KL:nabla), with the result being:
+
+
+
+$$-\nabla_\theta \text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t)) =- \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)} \left[ \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t|s_t) \right]$$
+
+
+
+##### Loss function form of k1 estimation in the reward function
+
+
+
+Thus, the loss function can be derived as:
+
+
+
+$$\begin{aligned} \mathcal{L}_{\text{KL}}(\pi_\theta, \pi_\text{ref}) &= \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \log \pi_\theta(a_t|s_t) \right] \end{aligned}$$
+
+
+
+This loss function can be used independently, but more often, it is reparameterized into the reward function as described in [eq:PPO_reward](#eq:PPO_reward) below, similar to PPO. This loss function requires computing the expectation over the entire vocabulary. It can be directly calculated over the full vocabulary in theory, but in practice, it is more commonly estimated using Monte Carlo sampling to optimize the distribution with a sufficiently large effective sample size.
+
+
+
+##### k2 loss function form
+
+
+
+As proven in [appendix:k2_loss](#appendix:k2_loss):
+
+
+
+The $k_2$ loss function is:
+
+
+
+$$\mathcal{L}_{k_2}(\theta) = \frac{1}{2} \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \left( \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right)^2 \right]$$
+
+
+
+Further verification by taking the gradient of the $\mathcal{L}_{k_2}(\theta)$ loss function:
+
+
+
+$$\begin{align} -\nabla_{\theta} \mathcal{L}_{k_2}(\theta)&= - \frac{1}{2} \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \nabla_{\theta} \left( \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right)^2 \right]\\ &= - \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_{\theta} \log \pi_{\theta}(a_t|s_t) \right] \end{align}$$
+
+
+
+It is concluded that the loss function of k1 estimation in the reward function is equivalent to the k2 loss function:
+
+
+
+$$\nabla_{\theta} \mathcal{L}_{k_2}(\theta) =\nabla_\theta \text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t))$$
+
+
+
+Thus, it follows that
+
+
+
+$$\mathcal{L}_{\text{KL}}(\pi_\theta, \pi_\text{ref}) = \nabla_{\theta} \mathcal{L}_{k_2}(\theta)$$
+
+
+
+### Combination of Specific Implementations of the RLHF Objective Optimization Function and Derivation of the PPO Reward Function
+
+
+
+Two components:
+
+
+
+1. **Reward term gradient**:
+
+
+
+$$\nabla_{\theta} \mathcal{L}_R(\theta) = \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ r(x,y) \nabla_\theta \log\pi_\theta(a_t|s_t) \right]$$
+
+
+
+2. **KL divergence term gradient** (specific derivation see Lemma [KL:nabla](#KL:nabla)):
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL}} = -\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t|s_t) \right]$$
+
+
+
+Combining the two yields the total gradient:
+
+
+
+$$\begin{aligned} -\nabla_\theta L_{total} &= \nabla_{\theta} \mathcal{L}_R - \beta \nabla_\theta \mathcal{L}_{\text{KL}} \\ &= \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \left( r(x,y) - \beta \log\frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right) \nabla_\theta \log \pi_\theta(a_t|s_t) \right] \end{aligned}$$
+
+
+
+### Construction of Equivalent Optimization Objectives and the Reward Function of the PPO Algorithm
+
+
+
+From Equation [k1_combine](#k1_combine), a new optimization objective can be re-derived and defined:
+
+
+
+$$\arg\max_{\theta} J' = \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[ r(x,y) - \beta \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right]$$
+
+
+
+This form internalizes the KL regularization term as part of the reward function, thereby re-parameterizing the optimization objective.
+
+
+
+Extracting the entire reward part of reinforcement learning, it is easy to derive the reward function identical to the PPO algorithm:
+
+
+
+$$\tilde{r}(a_t|s_t) = r(x, y) - \beta \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}$$
+
+
+
+At this point, due to the limitation of $r(x,y)$ and the combination of the KL term, the entire expression uses a Monte Carlo estimate, so the effective sample size must be sufficiently large.
+
+
+
+## Analysis of KL Divergence Optimization Methods
+
+
+
+### Gradient Estimation of Distribution Gradient Based on Sampling
+
+
+
+The definition of the KL gradient is:
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL}} = -\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t|s_t) \right]$$
+
+
+
+This expression takes the expectation over the entire vocabulary for $y$. In practical code engineering, due to limitations such as memory and computational cost, directly computing over the entire vocabulary is theoretically possible but expensive. Often, Monte Carlo sampling and other techniques are used to sample a mini-batch, and then the gradient is computed with respect to the model parameters and updated. A mini-batch is an intermediate state between the two most extreme cases, where the effective sample size is 1, and the effective sample size tends to infinity (expectation). We need to consider not only the derivation in expectation but also the single-sample case to evaluate the model optimization status under mini-batch conditions.
+
+
+
+Specifically, we discuss the approaches based on the full vocabulary and based on sampling:
+
+
+
+##### Full vocabulary
+
+
+
+An LLM is essentially a classifier, and its categories are ultimately finite (10k\(\sim\)30k). By traversing the entire vocabulary, the KL divergence can be calculated based on the definition of KL divergence [KL_define](#KL_define), which is equivalent to directly computing the KL divergence gradient by traversing the entire vocabulary:
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL}} = -\mathbb{E}_{x \sim D}\sum_{i=1}^{vocab\_size} \pi_{\theta_{\text{old}}}(a_t^i|s_t)\left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t^i|s_t)}{\pi_{\text{ref}}(a_t^i|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t^i|s_t) \right]$$
+
+
+
+The advantage of this method is that even with a batch\_size of 1, a single sample, the computed KL divergence and its gradient are exact.
+
+
+
+##### Based on Monte Carlo sampling
+
+
+
+Due to the large vocabulary size, in more engineering practices, people often use Monte Carlo sampling to approximate the KL divergence gradient on a limited sample and then perform mini-batch updates:
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL}} = -\frac{1}{N}\mathbb{E}_{x \sim D}\sum_{i=1}^{N} \pi_{\theta_{\text{old}}}(a_t^i|s_t) \left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t^i|s_t)}{\pi_{\text{ref}}(a_t^i|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t^i|s_t) \right]$$
+
+
+
+where $N$ is the number of samples. Theoretically, as long as the number of samples is sufficiently large, the sampled gradient can also approximate the gradient of the KL distribution well. This approach only requires recording the single-category probability value of the sampled trajectory $y_i$, which consumes less memory. However, it must satisfy the condition of having a sufficiently large effective sample size equivalent to the exact calculation of the KL divergence and its gradient over the entire vocabulary. Satisfying the condition of having a sufficiently large effective sample size is not easy. The sample size must be large enough, and the parameters must not change, which means more sampling and fewer updates, resulting in low training efficiency. In engineering practice, a mini-batch is often used, an intermediate state between a single sample and expectation. Even so, careful design is still required to be efficient while meeting the sampling conditions of having a sufficiently large "effective sample size."
+
+
+
+### Properties of Different Forms of KL Estimation Under Mini-Batch
+
+
+
+KL estimation is mainly defined as k1, k2, and k3 [kl_approx](#kl_approx). Below, we introduce the sampling gradients of different forms of KL estimation in single-sample and expectation cases, which are used to approximate the gradient of the KL distribution and optimize the KL distribution. The specific approaches and properties are described below.
+
+
+
+#### Which KL Estimation is Suitable for Direct Use as a Loss Function
+
+
+
+##### k1 estimation
+
+
+
+The loss function form of k1 directly as a loss is:
+
+
+
+$$\begin{aligned} \mathcal{L}_{\text{KL\_k1 loss}}(\pi_\theta, \pi_{\text{ref}}) &= \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}(\log\pi_\theta(a_t|s_t) - \log\pi_{\text{ref}}(a_t|s_t)) \\&=\mathbb{E}_{x \sim D}\sum_{i=1}^{batch\_size}\pi_\theta(a_t^i|s_t)(\log\pi_\theta(a_t^i|s_t) - \log\pi_{\text{ref}}(a_t^i|s_t)) \end{aligned}$$
+
+
+
+Its gradient expression is:
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL\_k1 loss}} = -\mathbb{E}_{x \sim D}\sum_{i=1}^{batch\_size}\pi_\theta(a_t^i|s_t)\nabla_\theta \log\pi_\theta(a_t^i|s_t)$$
+
+
+
+- **Single sample**:
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL\_k1 loss}} = -\mathbb{E}_{x \sim D}\pi_\theta(a_t^i|s_t)(\nabla_\theta \log\pi_\theta(a_t^i|s_t))$$
+
+
+
+This gradient always points in the direction of reducing the current policy probability. Sampling a particular sample reduces its generation probability. This leads to the continuous decay of the probability output of the policy network, eventually causing model collapse.
+
+
+
+- **Expectation**:
+
+
+
+Taking the expectation of the gradient:
+
+
+
+$$\begin{aligned} -\nabla_\theta \mathcal{L}_{\text{KL\_k1 loss}} &= -\mathbb{E}_{x \sim D}\sum_{i=1}^{\infty}\pi_\theta(a_t^i|s_t)\nabla_\theta \log\pi_\theta(a_t^i|s_t) \\&=-\mathbb{E}_{x \sim D}\sum_{i=1}^{\infty}\pi_\theta(a_t^i|s_t)\frac{\nabla_\theta\pi_\theta(a_t^i|s_t)}{\pi_\theta(a_t^i|s_t)} \\&=-\mathbb{E}_{x \sim D}\sum_{i=1}^{\infty}\nabla_\theta\pi_\theta(a_t^i|s_t) \\&=-\mathbb{E}_{x \sim D}\nabla_\theta\sum_{i=1}^{\infty}\pi_\theta(a_t^i|s_t) \\&=-\mathbb{E}_{x \sim D}\nabla_\theta1 =0 \end{aligned}$$
+
+
+
+When the effective sample size is particularly large, the model gradient is 0, meaning that using k1 estimation directly as a loss has almost no effect on model updates.
+
+
+
+- In summary, neither case estimates the gradient of the KL divergence distribution. Especially when the effective sample size is small, and the KL penalty term coefficient $\beta$ is large, the model is highly likely to collapse.
+
+
+
+##### k2 estimation
+
+
+
+$$\begin{aligned} -\nabla_\theta \mathcal{L}_{\text{KL\_k2 loss}}& = -\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t|s_t) \right]\\& = -\mathbb{E}_{x \sim D}\sum_{i=1}^{batch\_size}\pi_{\theta_{\text{old}}}(a_t^i|s_t)\left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t^i|s_t)}{\pi_{\text{ref}}(a_t^i|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t^i|s_t) \right] \end{aligned}$$
+
+
+
+- **Expectation**
+
+
+
+As shown in [k2_loss](#k2_loss), the k2 estimation is directly used as a loss function, and it is proven that it is equivalent to computing the gradient of the KL divergence in expectation, thereby optimizing the KL divergence. When the effective sample size is sufficiently large, it can effectively restrict the KL distance between the policy model and the reference model, preventing it from collapsing.
+
+
+
+- **Single sample**
+
+
+
+The gradient of the single-sample estimation is shown below:
+
+
+
+$$\begin{aligned} -\nabla_\theta \mathcal{L}_{\text{KL\_k2 loss}}& = -\mathbb{E}_{x \sim D}\pi_{\theta_{\text{old}}}(a_t^i|s_t)\left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t^i|s_t)}{\pi_{\text{ref}}(a_t^i|s_t)} \cdot \nabla_\theta \log \pi_\theta(a_t^i|s_t) \right] \\&=\mathbb{E}_{x \sim D}\pi_{\theta_{\text{old}}}(a_t^i|s_t)\left[( \log\pi_{\text{ref}}(a_t^i|s_t)-\log\pi_{\theta_{\text{old}}}(a_t^i|s_t) )\cdot \nabla_\theta \log \pi_\theta(a_t^i|s_t) \right] \end{aligned}$$
+
+
+
+When $\log\pi_{\text{ref}}(a_t^i|s_t)>\log\pi_{\theta_{\text{old}}}(a_t^i|s_t)$, $-\nabla_\theta \mathcal{L}_{\text{KL}}<0$, which reduces the generation probability of $\log\pi_{\theta(a_t^i|s_t)}$. The opposite is also true. Although a single sample does not restrict the KL distance, it does impose a certain restriction on the category $y_i$ of this sample, preventing it from deviating too far from the reference model. Therefore, it works well under small learning rates and samples, in conjunction with the small coefficient $\beta$ in [eq:PPO_reward](#eq:PPO_reward).
+
+
+
+However, it must be emphasized that when using a large learning rate with a single sample or a very low effective sample size, it may be unable to effectively restrict the KL distance and constrain the policy model's space, ultimately leading to model collapse. For on-policy algorithms such as GRPO, [liu2024deepseek](#liu2024deepseek) mentions that its computing cluster includes 2048 H800 GPUs, which can increase the batch\_size to 1k\(\sim\)2k, and in combination with gradient accumulation techniques, it may not encounter the problem of a small effective sample size and can effectively optimize the KL distribution. However, individual researchers may not have access to so many GPUs, and their batch\_size when using on-policy algorithms may be very small, leading to the failure of the Monte Carlo condition. It is recommended to use gradient accumulation techniques more when resources are limited or to use some off-policy algorithms that combine importance sampling (RF++/GRPO\_off-policy [grpo off policy](#grpo off policy)), which have a relatively large rollout batch\_size and can meet more effective samples.
+
+
+
+##### k3 estimation is biased
+
+
+
+The k3 loss function is as follows:
+
+
+
+$$\mathcal{L}_{\text{KL\_k3 loss}} = \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left(\frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_\theta(a_t|s_t)} - \log \frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_\theta(a_t|s_t)} - 1\right)$$
+
+
+
+The corresponding gradient expression reveals its nature as an approximation of "k2 estimation as a loss function":
+
+
+
+$$-\nabla_\theta \mathcal{L}_{\text{KL\_k3 loss}} =\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \left(\frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}-1\right) \nabla_\theta \log\pi_\theta(a_t|s_t)\right]$$
+
+
+
+Let $x=\frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}$. The gradients of "k2 estimation as a loss function" and "k3 estimation as a loss function" can be expressed as:
+
+
+
+$$\begin{align} \text{Gradient of k2 estimation as a loss function} &: \log x \cdot \nabla_\theta \log\pi_\theta \\ \text{Gradient of k3 estimation as a loss function} &: (x-1) \cdot \nabla_\theta \log\pi_\theta \end{align}$$
+
+
+
+When performing a Taylor expansion in the policy neighborhood ($x\approx1$), $\log x \approx x-1$, and the k2 gradient is unbiased. At this time, the k3 gradient forms a linear approximation of the k2 gradient. However, this approximation has two key flaws:
+
+
+
+1. **Bias**: When the policy significantly deviates from the reference policy ($x$ is far from 1, especially in the later stages of training when $\pi_{\text{ref}}$ is far from $\pi_{\theta_{\text{old}}}$, particularly when $\pi_{\text{ref}}>>\pi_{\theta_{\text{old}}}$), the approximation error grows nonlinearly. This can be visualized in [kl_visual_fig](#kl_visual_fig).
+
+2. **Asymmetry**: The response characteristics of $x-1$ are asymmetric for $\pi_{\theta_{\text{old}}}>\pi_{\text{ref}}$ and $\pi_{\theta_{\text{old}}}<\pi_{\text{ref}}$.
+
+
+
+Therefore, "k3 estimation as a loss function" is merely an approximation of "k2 estimation as a loss function." It can be clearly proven that the k3 loss is not necessarily better than the k2 loss! In experiments, it is also easy to observe that the GRPO algorithm using the k3 loss has larger variance fluctuations than the one using the k2 loss.
+
+
+
+![Comparison of KL gradient coefficient terms implemented by k1/k2, k3, and MiniMax-01 [li2025minimax](#li2025minimax). The code is shown in [kl_visaul](#kl_visaul). Compared to k1/k2, k3 exhibits exponential changes when the model's probability is much lower than that of the reference model, causing instability. (In the figure, $\log\pi_{\text{ref}}=-0.7$, corresponding to a probability of $\pi_{\text{ref}}\approx0.5$)](curve_kl.png){#kl_visual_fig}
+
+
+
+#### Which KL Estimation is Suitable for Use in the Reward Function
+
+
+
+Only specific forms of KL estimation are suitable as penalty terms in the PPO reward function.
+
+
+
+According to theoretical analysis, k1 estimation is applicable, as shown in [eq:PPO_reward](#eq:PPO_reward) and derived in [eq:k1_loss](#eq:k1_loss). It is equivalent to k2 estimation directly used as a loss function [k1k2eq](#k1k2eq), and its properties are identical.
+
+
+
+However, neither k2 nor k3 estimation is suitable as a penalty term for the following reasons:
+
+
+
+Considering that the estimated values $kl$ of k2 and k3 have the property of being always positive, their gradient directions always satisfy:
+
+
+
+$$-\nabla_\theta \text{KL}(\pi_\theta \| \pi_{\text{ref}}) =-\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} kl\nabla_\theta \log \pi_\theta(a_t|s_t)$$
+
+
+
+No matter the relationship between the probability distributions of $\pi_\theta(a_t|s_t)$ and $\pi_{\text{ref}}(a_t|s_t)$, $-\nabla_\theta \text{KL}(\pi_\theta \| \pi_{\text{ref}})$ is always less than 0. The gradient update direction will forcibly reduce the probability of the current policy $\pi_\theta$ generating any action $y$. This one-way penalty mechanism can lead to model collapse, whether in single-sample sampling or expectation.
+
+
+
+![Different KL experiments with the GRPO algorithm, batch=12, group\_size=6, based on the $x_r1$ framework [x_r1](#x_r1), $\beta=0.04$](kl.png){#kl_visual_fig}
+
+
+
+### KL Estimation in the Reward Function and Direct Use of KL Estimation as a Loss Function Can Be Interchanged
+
+
+
+k1 estimation can be reparameterized into the reward function as shown in [eq:PPO_reward](#eq:PPO_reward), specifically the k1 estimation part $- \beta \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}$, or it can be directly used as a loss function as shown in [eq:k1_loss](#eq:k1_loss). It is also completely equivalent to k2 estimation directly used as a loss function [k2_loss](#k2_loss).
+
+
+
+Combining [origin_reward](#origin_reward) and [k3_loss](#k3_loss), we can derive that reparameterizing "k3 directly as a loss function" into the reward function yields the reward function for GRPO\_off-policy [grpo off policy](#grpo off policy):
+
+
+
+$$\tilde{r}(a_t|s_t) = r(x, y) - \beta \left(1-\frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}\right)$$
+
+
+
+## GRPO\_off-policy
+
+
+
+When using GRPO\_on-policy with a limited number of personal GPUs, even with gradient accumulation, the batch\_size is small, resulting in a small effective sample size. The solution is to introduce the importance sampling and clipping of PPO-2, transforming it into an off-policy algorithm like PPO, which can increase the rollout\_batch. The rollout\_batch is sampled in batches without changing the model parameters, allowing for a sufficiently large effective sample size under resource constraints.
+
+
+
+The original formula given in the GRPO paper is:
+
+
+
+$$\begin{aligned} \mathcal{J}_{GRPO}(\theta) &= \mathbb{E}[q \sim P(Q), \{o_i\}_{i = 1}^{G} \sim \pi_{\theta_{old}}(O|q)] \\ & \frac{1}{G} \sum_{i = 1}^{G} \frac{1}{|o_i|} \sum_{t = 1}^{|o_i|} \Bigg\{ \min \left[ \frac{\pi_{\theta}(o_{i,t}|q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t}|q, o_{i,<t})} \hat{A}_{i,t}, \right. \\ & \left. \mathrm{clip} \left( \frac{\pi_{\theta}(o_{i,t}|q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t}|q, o_{i,<t})}, 1 - \varepsilon, 1 + \varepsilon \right) \hat{A}_{i,t} \right] - \beta \mathrm{D}_{KL}[\pi_{\theta}||\pi_{\text{ref}}] \Bigg\}, \end{aligned}$$
+
+
+
+Referring to [zang2025KLGRPO](#zang2025KLGRPO), the above formula can be simplified as:
+
+
+
+$$\mathbb{E}_{\pi_{\theta_{\text{old}}}}\left[\frac{\pi_{\theta}}{\pi_{\theta_{\text{old}}}} A - KL(\pi_{\theta}, \pi_{\text{ref}})\right] = \mathbb{E}_{\pi_{\theta_{\text{old}}}}\left[\frac{\pi_{\theta}}{\pi_{\theta_{\text{old}}}} A - \mathbb{E}_{\pi_{\theta}}(\log \pi_{\theta} - \log \pi_{\text{ref}})\right]$$
+
+
+
+Therefore, when the KL term is used as a loss, the formula implies that the KL divergence is calculated in expectation.
+
+
+
+Currently, the implementation of the "compute\_approx\_kl" function in mainstream codebases such as TRL [vonwerra2022trl](#vonwerra2022trl), OpenRLHF [hu2024openrlhf](#hu2024openrlhf), and Verl [sheng2024hybridflow](#sheng2024hybridflow) is:
+
+
+
+$$\mathbb{E}_{\pi_{\theta_{\text{old}}}}\left[\frac{\pi_{\theta}}{\pi_{\theta_{\text{old}}}} A - \mathbb{E}_{\pi_{\theta_{\text{old}}}}(\log \pi_{\theta} - \log \pi_{\text{ref}})\right]$$
+
+
+
+Since we sample using $\pi_{\theta_{\text{old}}}$ and update with $\pi_{\theta}$ unless it is a fully on-policy situation, it will lead to the loss of the derivative information of $\pi_{\theta}$. The original implementation only holds when it is fully on-policy or when the "full vocabulary (vocab\_size)" is retained and the KL divergence is calculated over the entire vocabulary. For off-policy algorithms like PPO, the original GRPO paper's approach is problematic.
+
+
+
+In addition to using the full vocabulary and on-policy, the more commonly used off-policy GRPO must be corrected. The correction method adds importance sampling and PPO2-clip to the gradient estimate of the KL divergence. After combining like terms, it is equivalent to hiding the KL divergence in the Reward like PPO:
+
+
+
+k1 estimation in the reward function/"k3 estimation directly as a loss function":
+
+
+
+$$\hat{R}_{i,t}= (\hat{A}_{i,t}-\beta \log\frac{\pi_{\theta}(o_{i,t}|q, o_{i,<t})}{\pi_{\text{ref}}(o_{i,t}|q, o_{i,<t})})$$
+
+
+
+"k3 estimation directly as a loss function" transferred to the reward function (biased):
+
+
+
+$$\hat{R}_{i,t}= \left(\hat{A}_{i,t}-\beta \left(1-\frac{\pi_{\text{ref}}(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}\right) \right)$$
+
+
+
+$$\begin{aligned} \mathcal{J}_{GRPO}(\theta) &= \mathbb{E}[q \sim P(Q), \{o_i\}_{i = 1}^{G} \sim \pi_{\theta_{old}}(O|q)] \\ & \frac{1}{G} \sum_{i = 1}^{G} \frac{1}{|o_i|} \sum_{t = 1}^{|o_i|} \\ & \left\{ \min \left[ \frac{\pi_{\theta}(o_{i,t}|q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t}|q, o_{i,<t})}\hat{R}_{i,t}, \right. \right. \\ & \left. \left. \mathrm{clip} \left( \frac{\pi_{\theta}(o_{i,t}|q, o_{i,<t})}{\pi_{\theta_{old}}(o_{i,t}|q, o_{i,<t})}, 1 - \varepsilon, 1 + \varepsilon \right) \hat{R}_{i,t} \right] \right\}. \end{aligned}$$
+
+
+
+The [relevant code](https://github.com/OpenRLHF/OpenRLHF/pull/840/files) has been submitted to OpenRLHF. From this perspective, the uniqueness of GRPO may only lie in Group Norm.
+
+
+
+In summary, GRPO has three methods for implementing KL: 1) Calculating KL according to the definition over the full vocabulary, which is computationally and memory-intensive, 2) Using on-policy with large hardware memory to achieve a large batch\_size, 3) GRPO\_off-policy, which is the most cost-effective in terms of comprehensive performance.
+
+
+
+#### Improvement of Group Norm
+
+
+
+Group Norm is unique to GRPO:
+
+
+
+The same prompt generates $G$ answers, which are scored by the reward model to obtain the group reward list $\mathbf{r} = \{r_1, r_2, \cdots, r_G\}$. Then, the reward list of the group is normalized as follows to obtain the advantage list $\hat{A}_{i,t}$:
+
+
+
+$$\hat{A}_{i,t} = \widetilde{r}_i = \frac{r_i - \text{mean}(\mathbf{r})}{\text{std}(\mathbf{r})},$$
+
+
+
+However, GRPO often collapses when using non-rule-based rewards, which is likely due to the $/\text{std}()$ operation in Group Norm: For example, if the reward\_list is $[0.99999,1.00001,0.99999,1.00001]$, the Adv\_list would be $[-0.8660, 0.8660, -0.8660, 0.8660]$. This means that the variance is very small and could possibly be due to numerical errors, which are exaggerated by Group Norm. The peak reward characteristic of GRPO gives it fast convergence but also instability.
+
+
+
+To avoid extreme cases, it is suggested to perform a clip operation on $/\text{std}$. To this end, we introduce the clip\_std function:
+
+
+
+$$\text{clip\_std}() = \max(\min(\text{std}(),\text{max}),\text{min})$$
+
+
+
+The advantage calculation function then becomes:
+
+
+
+$$\hat{A}_{i,t} = \widetilde{r}_i = \frac{r_i - \text{mean}(\mathbf{r})}{\text{clip\_std}(\mathbf{r})},$$
+
+
+
+PS: When the reward model's score is between 0.0 and 1.0, the standard deviation of the reward\_list calculated by Group Norm is always less than 1, as proven in [stdshort1](#stdshort1). Its role is to increase the distinction. The smaller the variance of the reward\_list, the greater the amplification degree, and the more significant the increase in distinction.
+
+
+
+## Analysis of the Limitations of DPO
+
+
+
+Despite the significant practical success of Direct Preference Optimization (DPO), there is still a gap between its theoretical foundation and practical application, especially in terms of optimizing the distribution.
+
+
+
+The theoretical objective of DPO is to optimize the **distribution** defined by Equation [dpo_fenbu](#dpo_fenbu). However, in practice, as shown in Equation [dpo_yangben](#dpo_yangben), this optimization process is implemented through **sampled samples**. According to the core argument of this paper, using gradient estimates based on sampling to approximate the gradient of the distribution and optimize the distribution requires satisfying the Monte Carlo condition, i.e., having a sufficiently large effective sample size. However, as an offline algorithm, DPO faces inherent challenges in meeting this condition and finds it difficult to satisfy the condition of policy function stability during sampling.
+
+
+
+Specifically, 1) existing research may use data from external datasets (such as data collected by GPT-4) or data generated by other models to train the DPO model. The distribution of these data may significantly differ from the distribution of the current model being optimized. 2) Secondly, even if the same model is used for sampling, labeling data, and training the model, there are potential issues. During the DPO training process, the model parameters will undergo multiple updates, causing the model distribution to change and no longer match the distribution during data sampling.
+
+
+
+The observations in [dpo_reward_chosen_hacking](#dpo_reward_chosen_hacking) further corroborate this issue: when training a model with data sampled from the same model, the chosen reward may continue to rise; whereas when training the current model with data sampled from other models, the chosen reward may decrease. This implies that DPO may encounter difficulties when using heterogeneous data or historical data to optimize the current policy distribution.
+
+
+
+To alleviate the above problems, some potential solutions include shifting to a more online-like algorithm mode, for example, 1) cyclically performing the process of sampling, labeling, and training; 2) introducing an additional SFT loss for positive samples in the DPO loss (in the extreme case, retraining the LLM model being trained by DPO with the positive samples from the data, wouldn't the sampling distribution of the LLM model and the training data distribution be consistent then), thereby approximating the Monte Carlo condition to some extent.
+
+
+
+However, DPO's core advantage lies in its offline nature, which allows for efficient utilization of large-scale pre-labeled data. If offline convenience is sacrificed to meet the Monte Carlo condition and it is shifted to an algorithm closer to online, it may lead to the loss of DPO's core advantage and introduce additional complexity.
+
+
+
+In summary, the ultimate goal of DPO is to optimize the distribution, but in practice, its optimization process relies on limited mini-batch samples, and it is difficult to keep the data sample distribution consistent with the sampling distribution of the current policy model. To achieve the best optimization effect, the training data and the model must satisfy or approximately the Monte Carlo condition. How to effectively utilize offline data to optimize the distribution and meet the Monte Carlo condition as much as possible is a key challenge for further improvement of DPO.
+
+
+
+## Derivation of KL Divergence Gradient for Classification Models
+
+
+
+### Definition of KL Divergence
+
+
+
+The KL divergence measures the difference between two discrete probability distributions $\pi_\theta$ and $\pi_{\text{ref}}$, defined as:
+
+
+
+$$\begin{aligned} \text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t)) &= \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[ \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right] \\&= \mathbb{E}_{x \sim D} \sum_{a_t \in {Vocab}}\left( \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}\right), \end{aligned}$$
+
+
+
+where $\mathcal{Y}$ is the discrete category space.
+
+
+
+### Steps for Deriving the KL Divergence Gradient
+
+
+
+#### Step 1: Expand the KL expression
+
+
+
+Write out the discrete summation form directly:
+
+
+
+$$\text{KL}\big(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\big) = \sum_{a_t \in {Vocab} } \pi_\theta(a_t|s_t) \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}.$$
+
+
+
+#### Step 2: Apply the gradient operator
+
+
+
+Take the gradient with respect to $\theta$:
+
+
+
+$$-\nabla_\theta \text{KL}\big(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\big) =- \nabla_\theta \sum_{a_t \in {Vocab} } \pi_\theta(a_t|s_t) \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}.$$
+
+
+
+#### Step 3: Interchange summation and gradient
+
+
+
+Since the summation is finite and $\pi_\theta(a_t|s_t)$ is smooth, the summation and gradient can be interchanged:
+
+
+
+$$-\nabla_\theta \text{KL}\big(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\big) = -\sum_{a_t \in {Vocab} } \nabla_\theta \left[ \pi_\theta(a_t|s_t) \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right].$$
+
+
+
+#### Step 4: Decompose using the product rule
+
+
+
+Apply the product rule to each term:
+
+
+
+$$\begin{aligned} -\nabla_\theta& \left[ \pi_\theta(a_t|s_t) \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right] \\&=- [\underbrace{\nabla_\theta \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}}_{\text{Term 1}} + \underbrace{\pi_\theta(a_t|s_t) \cdot \nabla_\theta \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}}_{\text{Term 2}}]. \end{aligned}$$
+
+
+
+#### Step 5: Simplify Term 2
+
+
+
+Since $\pi_{\text{ref}}(a_t|s_t)$ is independent of $\theta$, we have:
+
+
+
+$$\nabla_\theta \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} = \nabla_\theta \log \pi_\theta(a_t|s_t) = \frac{\nabla_\theta \pi_\theta(a_t|s_t)}{\pi_\theta(a_t|s_t)}.$$
+
+
+
+Thus, Term 2 simplifies to:
+
+
+
+$$\pi_\theta(a_t|s_t) \cdot \frac{\nabla_\theta \pi_\theta(a_t|s_t)}{\pi_\theta(a_t|s_t)} = \nabla_\theta \pi_\theta(a_t|s_t).$$
+
+
+
+#### Step 6: Combine the two terms
+
+
+
+Add Term 1 and Term 2:
+
+
+
+$$\sum_{a_t \in {Vocab} } \left[ \nabla_\theta \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} + \nabla_\theta \pi_\theta(a_t|s_t) \right].$$
+
+
+
+#### Step 7: Handle the normalization condition
+
+
+
+Since $\sum_{a_t \in {Vocab} } \pi_\theta(a_t|s_t) = 1$, its gradient is 0:
+
+
+
+$$\sum_{a_t \in {Vocab} } \nabla_\theta \pi_\theta(a_t|s_t) = \nabla_\theta \sum_{a_t \in {Vocab} } \pi_\theta(a_t|s_t) = \nabla_\theta 1 = 0.$$
+
+
+
+Thus, the second term sums to 0, leaving only the first term:
+
+
+
+$$-\nabla_\theta \text{KL}\big(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\big) = -\sum_{a_t \in {Vocab} } \nabla_\theta \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}.$$
+
+
+
+#### Step 8: Logarithmic derivative trick
+
+
+
+Using $\nabla_\theta \pi_\theta(a_t|s_t) = \pi_\theta(a_t|s_t) \nabla_\theta \log \pi_\theta(a_t|s_t)$, rewrite it as:
+
+
+
+$$-\nabla_\theta \text{KL}\big(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)\big) = -\sum_{a_t \in {Vocab} } \pi_\theta(a_t|s_t) \nabla_\theta \log \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_\theta(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)}.$$
+
+
+
+#### Step 9: Expectation form
+
+
+
+The final gradient can be expressed as an expectation:
+
+
+
+$$-\nabla_\theta \text{KL}(\pi_\theta(\cdot|s_t) \| \pi_{\text{ref}}(\cdot|s_t)) =- \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)}\left[ \nabla_\theta \log \pi_\theta(a_t|s_t) \cdot \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right].$$
+
+
+
+### Derivation of the loss function for k2 loss
+
+
+
+KL gradient
+
+
+
+$$\begin{align} &-\nabla_\theta \text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t))\\&= - \mathbb{E}_{x \sim D,y\sim\pi_{\theta}(\cdot|x)} \left[ \log \frac{\pi_{\theta_{\text{old}}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \cdot \nabla_{\theta} \log \pi_{\theta}(a_t|s_t) \right] \end{align}$$
+
+
+
+$$\begin{align} &-\nabla_\theta \text{KL}(\pi_\theta(a_t|s_t) \| \pi_{\text{ref}}(a_t|s_t))\bigg|_{\theta = \theta_{\text{old}}}\\&= - \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \nabla_{\theta} \log \pi_{\theta_\text{old}}(a_t|s_t) \cdot \log \frac{\pi_{\theta_\text{old}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right]\\ &= - \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \left. \nabla_{\theta} \log \pi_{\theta}(a_t|s_t) \right|_{\theta = \theta_{\text{old}}} \cdot \log \frac{\pi_{\theta_\text{old}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right]\\ &= - \mathbb{E}_{x \sim D,x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \left. \nabla_{\theta} \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right|_{\theta = \theta_{\text{old}}} \cdot \log \frac{\pi_{\theta_\text{old}}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right]\\ &= - \frac{1}{2} \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)} \left[ \left. \nabla_{\theta} \left( \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right)^2 \right|_{\theta = \theta_{\text{old}}} \right] \end{align}$$
+
+
+
+Thus, the loss function under $k_2$ loss is
+
+
+
+$$\mathcal{L}_{k_2}(\theta) = \frac{1}{2} \mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[ \left( \log \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\text{ref}}(a_t|s_t)} \right)^2 \right]$$
+
+
+
+## Derivation of DPO
+
+
+
+Based on the reward maximization objective with KL constraints, the operable Direct Preference Optimization objective function is derived [rafailov2023direct](#rafailov2023direct). First, establish the basic optimization problem:
+
+
+
+$$\begin{aligned} \max_{\pi} &\ \mathbb{E}_{x \sim \mathcal{D}, y \sim \pi(y|x)}[r(x, y)] - \beta D_{\mathrm{KL}}[\pi(y|x) \| \pi_{\mathrm{ref}}(y|x)] \\ = \max_{\pi} &\ \mathbb{E}_{x \sim \mathcal{D}} \mathbb{E}_{y \sim \pi(y|x)} \left[ r(x, y) - \beta \log\frac{\pi(y|x)}{\pi_{\mathrm{ref}}(y|x)} \right] \\ = \min_{\pi} &\ \mathbb{E}_{x \sim \mathcal{D}} \mathbb{E}_{y \sim \pi(y|x)} \left[ \log\frac{\pi(y|x)}{\pi_{\mathrm{ref}}(y|x)} - \frac{1}{\beta}r(x, y) \right]\\=\min_{\pi} &\mathbb{E}_{x \sim \mathcal{D}} \mathbb{E}_{y \sim \pi(y|x)} \left[ \log \frac{\pi(y|x)}{\frac{1}{Z(x)} \pi_{\text{ref}}(y|x) \exp \left( \frac{1}{\beta} r(x, y) \right)} - \log Z(x) \right] \end{aligned}$$
+
+
+
+The partition function $Z(x)$ constructs the probability distribution:
+
+
+
+$$Z(x) = \sum_{y \in {Vocab}} \pi_{\mathrm{ref}}(y|x)\exp\left( \frac{1}{\beta}r(x, y) \right)$$
+
+
+
+Define the new reference distribution $\pi^*$ as:
+
+
+
+$$\pi^*(y|x) = \frac{1}{Z(x)}\pi_{\mathrm{ref}}(y|x)\exp\left( \frac{1}{\beta}r(x, y) \right)$$
+
+
+
+Reconstruct the objective function as:
+
+
+
+$$\begin{aligned} & \min_\pi \mathbb{E}_{x \sim \mathcal{D}, y \sim \pi(y|x)} \left[ \log \frac{\pi(y|x)}{\pi^*(y|x)} - \log Z(x) \right] \\ &= \min_\pi \mathbb{E}_{x \sim \mathcal{D}} \left[ \mathbb{E}_{y \sim \pi(y|x)} \left[ \log \frac{\pi(y|x)}{\pi^*(y|x)} \right] - \log Z(x) \right] \\ &= \min_\pi \mathbb{E}_{x \sim \mathcal{D}} \left[ D_{KL} \left( \pi(y|x) \parallel \pi^*(y|x) \right) - \log Z(x) \right] \end{aligned}$$
+
+
+
+Since $Z(x)$ is independent of the policy $\pi$, the optimization objective simplifies to minimizing the KL divergence term. According to the non-negativity of the KL divergence, the global optimal solution is achieved when $\pi = \pi^*$.
+
+
+
+### From Reward Modeling to Preference Learning
+
+
+
+There are two major obstacles in directly solving $\pi^*$ in practical applications: 1) The true reward function $r^*$ is unknown; 2) The calculation of the partition function $Z(x)$ involves an integral over the entire response space. To address these issues, we introduce the preference learning framework.
+
+
+
+Using the Bradley-Terry model, for input $x$ and response pair $(y_w, y_l)$, the preference probability is modeled as:
+
+
+
+$$p^*(y_w \succ y_l|x) = \frac{\exp(r^*(x, y_w))}{\exp(r^*(x, y_w)) + \exp(r^*(x, y_l))}$$
+
+
+
+The key breakthrough lies in establishing an explicit connection between the reward function and the optimal policy. From Equation (2), we have:
+
+
+
+$$r(x,y) = \beta \log\frac{\pi^*(y|x)}{\pi_{\mathrm{ref}}(y|x)} + \beta \log Z(x)$$
+
+
+
+Substituting the reward difference expression into the preference probability model:
+
+
+
+$$\begin{aligned} p^*(y_w \succ y_l|x) &= \frac{1}{1 + \exp\left( \beta\log\frac{\pi^*(y_l|x)}{\pi_{\mathrm{ref}}(y_l|x)} - \beta\log\frac{\pi^*(y_w|x)}{\pi_{\mathrm{ref}}(y_w|x)} \right)} \end{aligned}$$
+
+
+
+### Final Objective Function
+
+
+
+Through maximum likelihood estimation, we obtain the parameterized objective function for directly optimizing the policy:
+
+
+
+$$\mathcal{L}_{\mathrm{DPO}}(\pi_\theta; \pi_{\mathrm{ref}}) = -\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}} \left[ \log \sigma \left( \beta \log\frac{\pi_\theta(y_w|x)}{\pi_{\mathrm{ref}}(y_w|x)} - \beta \log\frac{\pi_\theta(y_l|x)}{\pi_{\mathrm{ref}}(y_l|x)} \right) \right]$$
+
+
+
+### DPO Gradient
+
+
+
+$$\begin{aligned} &\nabla_{\theta}\mathcal{L}_{\text{DPO}}(\pi_{\theta};\pi_{\text{ref}}) = \\ &-\beta\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\left[\underbrace{\sigma(\hat{r}_{\theta}(x,y_l) - \hat{r}_{\theta}(x,y_w))}_{\text{higher weight when reward estimate is wrong}} \left[\underbrace{\nabla_{\theta}\log\pi(y_w\mid x)}_{\text{increase likelihood of }y_w} - \underbrace{\nabla_{\theta}\log\pi(y_l\mid x)}_{\text{decrease likelihood of }y_l} \right]\right]. \end{aligned}$$
+
+
+
+## Importance Sampling and PPO-2 Clip
+
+
+
+### Basic Concepts and Motivation
+
+
+
+Importance Sampling is a key technique in reinforcement learning for off-policy learning. Its core idea is to estimate the expectation of the target policy by introducing the sampling distribution of the behavior policy. This method has a dual significance in policy optimization:
+
+
+
+1. Sample reuse: It allows using old samples generated by historical policies for current policy updates, significantly improving data utilization.
+
+2. Variance control: Correcting the probability distribution deviation between the new and old policies with importance weights maintains the unbiased estimation property.
+
+
+
+### Policy Gradient Derivation
+
+
+
+Consider the basic form of the policy gradient:
+
+
+
+$$\nabla_{\theta}J(\theta) = \mathbb{E}_{(a_t,s_t)\sim\pi_{\theta}}\left[A(x,y)\nabla_{\theta}\log\pi_{\theta}(a_t|s_t)\right]$$
+
+
+
+When transitioning to an off-policy update, the importance weight (Importance Weight) $\rho_t = \frac{\pi_{\theta}(a_t|s_t)}{\pi_{\theta'}(a_t|s_t)}$ needs to be introduced:
+
+
+
+$$\begin{aligned} \nabla_{\theta}J(\theta) &= \mathbb{E}_{(a_t,s_t)\sim\pi_{\theta'}}\left[\frac{\pi_{\theta}(a_t,s_t)}{\pi_{\theta'}(a_t,s_t)}A_{\theta}(a_t,s_t)\nabla_{\theta}\log\pi_{\theta}(a_t|s_t)\right]\\ &= \mathbb{E}_{(a_t,s_t)\sim\pi_{\theta'}}\left[\frac{\pi_{\theta}(a_t|s_t)\cancel{\pi_{\theta}(s_t)}}{\pi_{\theta'}(a_t|s_t)\cancel{\pi_{\theta'}(s_t)}}A_{\theta}(s_t,a_t)\nabla_{\theta}\log\pi_{\theta}(a_t|s_t)\right]\\ &\approx\mathbb{E}_{(a_t,s_t)\sim\pi_{\theta'}}\left[\frac{\pi_{\theta}(a_t|s_t)}{\pi_{\theta'}(a_t|s_t)}A_{\theta'}(a_t,s_t)\nabla_{\theta}\log\pi_{\theta}(a_t|s_t)\right] \end{aligned}$$
+
+
+
+The derivation includes two important approximations:
+
+
+
+- State distribution cancellation assumption: $\pi_{\theta}(s_t) \approx \pi_{\theta'}(s_t)$, which holds when the policy update is small
+
+- Advantage function approximation: $A_{\theta}(a_t,s_t) \approx A_{\theta'}(a_t,s_t)$, requiring the difference between the new and old policies to be controllable
+
+
+
+### Formalization of the Objective Function
+
+
+
+Let $\theta' = \theta_{\text{old}}$, and we obtain the off-policy objective function:
+
+
+
+$$J(\theta)=\mathbb{E}_{x \sim D,y\sim\pi_{\theta_{\text{old}}}(\cdot|x)}\left[\frac{\pi_{\theta}(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}A_{\theta_{\text{old}}}(a_t,s_t)\right]$$
+
+
+
+This objective function has the following characteristics:
+
+
+
+1. **Unbiasedness**: It remains an unbiased estimate when the support sets of $\pi_{\theta}$ and $\pi_{\theta_{\text{old}}}$ are the same
+
+2. **Variance sensitivity**: The numerical stability of the importance weight $\rho_t$ directly affects the gradient quality
+
+3. **Policy constraint**: The difference between $\pi_{\theta}$ and $\pi_{\theta_{\text{old}}}$ needs to be restricted using measures such as KL divergence
+
+
+
+### PPO-2 Clip Method
+
+
+
+To address the variance issue of importance sampling, the PPO-2 clip proposes a clipped surrogate objective function:
+
+
+
+$$J^{\text{clip}}(\theta) = \mathbb{E}_{t}\left[\min\left(\rho_t A_{\theta_{\text{old}}}(a_t,s_t), \ \text{clip}(\rho_t, 1-\epsilon, 1+\epsilon) A_{\theta_{\text{old}}}(a_t,s_t)\right)\right]$$
+
+
+
+where $\rho_t = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}$, and $\epsilon$ is the clipping threshold (usually taken as 0.1-0.2). This method achieves two-way clipping:
+
+
+
+1. When $A_t>0$, it restricts the policy improvement to no more than $1+\epsilon$
+
+2. When $A_t<0$, it restricts the policy degradation to no more than $1-\epsilon$
+
+
+
+Core advantages:
+
+
+
+- **Gradient stability**: Hard clipping avoids excessive policy updates
+
+- **Computational efficiency**: No need to calculate additional constraint terms such as KL divergence
+
+- **Compatibility with advantages**: Compatible with various advantage estimation methods such as GAE
+
+
+
+This design significantly improves the stability of policy optimization while ensuring sample efficiency, making it one of the most widely used algorithms in deep reinforcement learning.
+
+
+
+## k3 Estimation Does Not Have Absolute Advantage
+
+
+
+Schulman, John~[kl_approx](#kl_approx) argues that the k3 estimation has an absolute advantage over k1 and k2 estimations, with smaller bias and variance. However, even in pure KL divergence estimation, this is not necessarily true.
+
+
+
+Compared to the original implementation [kl_approx](#kl_approx), the following code corrects the calculation of true kl:
+
+
+
+```python
+
+import torch.distributions as dis
+
+import torch
+
+p = dis.Normal(loc=0, scale=1)
+
+q = dis.Normal(loc=0.1, scale=0.2)
+
+x = q.sample(sample_shape=(10_000,))
+
+truekl = dis.kl_divergence(q, p)
+
+print("true", truekl)
+
+logr = p.log_prob(x) - q.log_prob(x)
+
+k1 = -logr
+
+k2 = logr ** 2 / 2
+
+k3 = (logr.exp() - 1) - logr
+
+k4 = torch.where(k1 < 0, k3, torch.minimum(k1, k3))
+
+r = torch.exp(logr)
+
+clip_r = torch.clamp(r,max=10)
+
+k3_clip = clip_r - 1 - logr
+
+for k in (k1, k2, k3, k4, k3_clip):
+
+    print((k.mean() - truekl) / truekl, k.std() / truekl)
+
+```
+
+
+
+The output is:
+
+
+
+```python
+
+truekl tensor(1.1344)
+
+tensor(0.0007) tensor(0.5896)
+
+tensor(-0.2348) tensor(0.4524)
+
+tensor(-0.4051) tensor(2.4417)
+
+tensor(-0.4051) tensor(2.4417)
+
+tensor(-0.4676) tensor(0.4370)
+
+```
+
+
+
+The variance of the k3 estimate is much larger than that of the k1 estimate and the true value, mainly due to the $\exp()$ calculation. To address this, we propose $k3\_clip$, which limits the maximum value of $\exp()$, avoiding the problem caused by non-linear numerical growth.
+
+
+
+## GROUP Norm Variance is Always Less Than 1
+
+
+
+When the elements in the reward list are restricted between 0 and 1, its variance is definitely not greater than 1. The following is a rigorous mathematical proof of this conclusion:
+
+
+
+### Mathematical Proof
+
+
+
+Let the list be $x_1, x_2, \cdots, x_n$, where each element satisfies $0 \leq x_i \leq 1$.
+
+
+
+The mean of the list is defined as: $\bar{x} = \frac{1}{n}\sum_{i=1}^{n}x_i$
+
+
+
+The formula for calculating the variance is: $\text{Var}(X) = \frac{1}{n}\sum_{i=1}^{n}(x_i - \bar{x})^2$
+
+
+
+The reasoning process is as follows:
+
+
+
+1. Since each element satisfies $0 \leq x_i \leq 1$, the mean must also be within this range, i.e., $0 \leq \bar{x} \leq 1$.
+
+2. For any element $x_i$, the range of its difference from the mean is $-1 \leq x_i - \bar{x} \leq 1$.
+
+   - When $x_i = 0$ and $\bar{x} = 1$, the minimum value of $-1$ is reached
+
+   - When $x_i = 1$ and $\bar{x} = 0$, the maximum value of $1$ is reached
+
+3. After squaring the difference, we get $0 \leq (x_i - \bar{x})^2 \leq 1$.
+
+4. Since the variance $\text{Var}(X)$ is the average of these squared differences, the variance must also satisfy: $0 \leq \text{Var}(X) \leq 1$.
+
+
+
+## Sampling KL Gradient Coefficient Visualization Code
+
+
+
+```python
+
+import torch
+
+import matplotlib.pyplot as plt
+
+
+
+# Define a range for plotting the curve
+
+pertokenlogps = torch.linspace(-3, 2, steps=400)
+
+
+
+# Calculate the values for each curve
+
+curve2 = pertokenlogps + 0.7
+
+curve3 = 1 - torch.exp(-0.7 - pertokenlogps)
+
+curve4 = torch.exp(pertokenlogps) - torch.exp(torch.tensor(-0.7))
+
+# Plot the curves
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(pertokenlogps, curve2, label='pertokenlogps - (-0.7)  (k1/k2)')
+
+plt.plot(pertokenlogps, curve3, label='1 - exp(-0.7 - pertokenlogps)   (k3)')
+
+plt.plot(pertokenlogps, curve4, label='exp(pertokenlogps) - exp(-0.7) minimax')
+
+plt.xlabel('pertokenlogps')
+
+plt.ylabel('Value')
+
+plt.title('Set log \pi_ref = -0.7, as log(0.5) = -0.69.')
+
+plt.legend()
+
+plt.grid(True)
+
+plt.show()
+
+```
+
+
+
+---
+
+# 参考文献
+
+- Schulman, John. (2020). *Approximating KL Divergence*. [Online] Available: [http://joschu.net/blog/kl-approx.html](http://joschu.net/blog/kl-approx.html) [2025-03-25] [kl_approx](#kl_approx)
+- dhcode-cpp. (2025). *X-R1*. [Online] Available: [https://github.com/dhcode-cpp/X-R1](https://github.com/dhcode-cpp/X-R1) [2025-03-25] [x_r1](#x_r1)
+- Shao, Zhihong, et al. (2024). "Deepseekmath: Pushing the limits of mathematical reasoning in open language models." *arXiv preprint arXiv:2402.03300*. [shao2024deepseekmath](#shao2024deepseekmath)
+- Hu, Jian, et al. (2024). "Openrlhf: An easy-to-use, scalable and high-performance rlhf framework." *arXiv preprint arXiv:2405.11143*. [hu2024openrlhf](#hu2024openrlhf)
+- Sheng, Guangming, et al. (2024). "Hybridflow: A flexible and efficient rlhf framework." *arXiv preprint arXiv:2409.19256*. [sheng2024hybridflow](#sheng2024hybridflow)
+- von Werra, Leandro, et al. (2020). *TRL: Transformer Reinforcement Learning*. [Online] Available: [https://github.com/huggingface/trl](https://github.com/huggingface/trl) [2025-03-25] [vonwerra2022trl](#vonwerra2022trl)
+- Zang, Hongyu. (2025). *The Critical Implementation Detail of KL Loss in GRPO*. [Online] Available: [https://hongyuzang.notion.site/The-critical-implementation-detail-of-KL-loss-in-GRPO-1ae3fe2c1ff9809a9307c5402e190373](https://hongyuzang.notion.site/The-critical-implementation-detail-of-KL-loss-in-GRPO-1ae3fe2c1ff9809a9307c5402e190373) [2025-03-25] [zang2025KLGRPO](#zang2025KLGRPO)
+- Rafailov, Rafael, et al. (2023). "Direct preference optimization: Your language model is secretly a reward model." *Advances in Neural Information Processing Systems*, 36, 53728–53741. [rafailov2023direct](#rafailov2023direct)
+- Li, Aonian, et al. (2025). "Minimax-01: Scaling foundation models with lightning attention." *arXiv preprint arXiv:2501.08313*. [li2025minimax](#li2025minimax)
+- 蜡笔小熊猫. (2024). *为什么DPO的chosen reward会和reject reward一起降低？*. [Online] Available: [https://zhuanlan.zhihu.com/p/692826816](https://zhuanlan.zhihu.com/p/692826816) [2025-03-25] [dpo_reward_chosen_hacking](#dpo_reward_chosen_hacking)
+- Black, Kevin, et al. (2023). "Training diffusion models with reinforcement learning." *arXiv preprint arXiv:2305.13301*. [black2023training](#black2023training)
+- Ho, Jonathan, et al. (2020). "Denoising diffusion probabilistic models." *Advances in neural information processing systems*, 33, 6840–6851. [ho2020denoising](#ho2020denoising)
+- von Platen, Patrick, et al. (2022). *Diffusers: State-of-the-art diffusion models*. [Online] Available: [https://github.com/huggingface/diffusers](https://github.com/huggingface/diffusers) [2025-03-25] [von-platen-etal-2022-diffusers](#von-platen-etal-2022-diffusers)
+- Wallace, Bram, et al. (2024). "Diffusion model alignment using direct preference optimization." *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition*, 8228–8238. [wallace2024diffusion](#wallace2024diffusion)
+- Zhang, Yinan, et al. (2024). "Large-scale reinforcement learning for diffusion models." *European Conference on Computer Vision*, 1–17. [zhang2024large](#zhang2024large)
+- Zhou, Zhenglin, et al. (2025). "DreamDPO: Aligning Text-to-3D Generation with Human Preferences via Direct Preference Optimization." *arXiv preprint arXiv:2502.04370*. [zhou2025dreamdpo](#zhou2025dreamdpo)
+- Liu, Aixin, et al. (2024). "Deepseek-v3 technical report." *arXiv preprint arXiv:2412.19437*. [liu2024deepseek](#liu2024deepseek)
+- Ouyang, Long, et al. (2022). "Training language models to follow instructions with human feedback." *Advances in neural information processing systems*, 35, 27730–27744. [ouyang2022training](#ouyang2022training)
+- Stiennon, Nisan, et al. (2020). "Learning to summarize with human feedback." *Advances in neural information processing systems*, 33, 3008–3021. [stiennon2020learning](#stiennon2020learning)
+- Jaques, Natasha, et al. (2019). "Way off-policy batch deep reinforcement learning of implicit human preferences in dialog." *arXiv preprint arXiv:1907.00456*. [jaques2019way](#jaques2019way)
