@@ -1,3 +1,26 @@
+---
+# title
+title: "Rethinking KL Divergence in RLHF"
+subtitle: "Rethinking KL Divergence in RLHF"
+date: "2025-03-25"
+author: 
+  name: "刘祎铭"
+  email: "letusgo126@gmail.com"
+copyright:
+  holder: "刘祎铭"
+  year: 2025
+# abstract
+abstract-title: Takeways
+abstract: |
+toc-expand: false
+# citation
+citation: false # Manual citation
+# language
+toc-title: 目录
+categories:
+    - English 
+---
+
 # Rethinking KL Divergence in RLHF: From Single Sample to Mini-Batch to Expectation
 
 ## Core Argument: Sufficient Effective Sample Size
