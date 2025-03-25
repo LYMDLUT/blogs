@@ -2,16 +2,12 @@ project:
   type: website
 
 website:
-  site-url: https://tongyx361.github.io/blogs
-  title: "Shawn/Yuxuan Tong 童雨轩"
+  site-url: https://github.com/LYMDLUT/blogs
+  title: "LYM 刘祎铭"
   navbar:
     right:
-      - icon: person
-        href: https://tongyx361.github.io
-      - icon: twitter-x
-        href: https://x.com/tongyx361
       - icon: github
-        href: https://github.com/tongyx361
+        href: https://github.com/LYMDLUT
 format:
   html: 
     theme: # https://quarto.org/docs/output-formats/html-themes.html
