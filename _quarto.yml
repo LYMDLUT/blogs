@@ -2,7 +2,7 @@ project:
   type: website
 
 website:
-  site-url: https://github.com/LYMDLUT/blogs
+  site-url: https://LYMDLUT.github.io/blogs
   title: "LYM 刘祎铭"
   navbar:
     right:
